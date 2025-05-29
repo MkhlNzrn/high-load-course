@@ -12,6 +12,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Semaphore
 
 
 // Advice: always treat time as a Duration
@@ -37,6 +38,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
+    private var semaphore = Semaphore(parallelRequests)
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -55,6 +58,7 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
+            semaphore.acquire()
             rateLimiter.tickBlocking()
             client.newCall(request).execute().use { response ->
                 val body = try {
@@ -89,6 +93,9 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        }
+        finally {
+            semaphore.release()
         }
     }
 
