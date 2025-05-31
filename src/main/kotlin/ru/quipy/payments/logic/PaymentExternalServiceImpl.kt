@@ -2,21 +2,20 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -25,46 +24,49 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
-        private val emptyBody = RequestBody.create(null, ByteArray(0))
-
         private val mapper = ObjectMapper().registerKotlinModule()
     }
 
+    // Параметры конфигурации
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
-
-    private var rateLimiter: RateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequests = properties.parallelRequests
 
-    private val executor: ExecutorService = Executors.newFixedThreadPool(parallelRequests)
+    // Лимитер по RPS
+    private val rateLimiter: RateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
-    private val client = OkHttpClient.Builder()
-        .callTimeout(Duration.ofMillis(1300L))
-        .build()
-
+    // Ограничение числа параллельных операций
     private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
 
+    // Пул потоков
+    private val executor: ExecutorService = Executors.newFixedThreadPool(parallelRequests)
+
+    // HTTP/2 клиент с привязкой к ExecutorService
+    private val client: HttpClient = HttpClient.newBuilder()
+        .executor(executor)
+        .version(HttpClient.Version.HTTP_2)
+        .connectTimeout(Duration.ofSeconds(1))
+        .build()
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
         val transactionId = UUID.randomUUID()
-        logger.info("[$accountName] Submit for $paymentId, txId: $transactionId")
+        logger.info("[$accountName] Submitting payment: $paymentId, txId: $transactionId")
 
+        // Фиксация момента отправки
         paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
         executor.submit {
+            // Проверка окна параллельных запросов
             while (true) {
-                val windowResponse = ongoingWindow.putIntoWindow()
-                if (windowResponse is NonBlockingOngoingWindow.WindowResponse.Success) {
-                    break
-                }
+                val result = ongoingWindow.putIntoWindow()
+                if (result is NonBlockingOngoingWindow.WindowResponse.Success) break
+
                 if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
-                    logger.warn("[$accountName] Parallel requests limit timeout for payment $paymentId. Aborting external call.")
+                    logger.warn("[$accountName] Timeout on entering window for $paymentId")
                     paymentESService.update(paymentId) {
                         it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
                     }
@@ -72,64 +74,61 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
 
-            val request = Request.Builder()
-                .url("http://localhost:1234/external/process?serviceName=$serviceName&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                .post(emptyBody)
+            // Проверка ограничения частоты
+            while (!rateLimiter.tick()) {
+                if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
+                    logger.warn("[$accountName] RPS deadline violation for $paymentId")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "RPS violation")
+                    }
+                    ongoingWindow.releaseWindow()
+                    return@submit
+                }
+            }
+
+            // Формируем URI
+            val uri = URI.create(
+                "http://localhost:1234/external/process?serviceName=$serviceName&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+            )
+
+            // Собираем HTTP-запрос
+            val request = HttpRequest.newBuilder()
+                .uri(uri)
+                .timeout(Duration.ofMillis(1300))
+                .header("x-idempotency-key", paymentId.toString())
+                .POST(HttpRequest.BodyPublishers.noBody())
                 .build()
 
-            var delay = 1000L
-            var maxRetries = 10
-            var attempt = 0
+            // Отправляем запрос асинхронно
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .whenComplete { response, throwable ->
+                    try {
+                        if (throwable != null) {
+                            // Ошибка сети, логируем
+                            logger.error("[$accountName] Exception on payment $paymentId", throwable)
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = throwable.message)
+                            }
+                        } else {
+                            // Успешный или неуспешный HTTP-ответ
+                            val body = try {
+                                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                            } catch (e: Exception) {
+                                logger.warn("[$accountName] Could not parse response for $paymentId", e)
+                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Parse error")
+                            }
 
-            while (attempt < maxRetries) {
-                try {
-                    while (!rateLimiter.tick()) {
-                        if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
-                            throw SocketTimeoutException()
-                        }
-                    }
+                            logger.info("[$accountName] Got response for $paymentId: success=${body.result}")
 
-                    client.newCall(request).execute().use { response ->
-                        val body = try {
-                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                        } catch (e: Exception) {
-                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                        }
-                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                        if (body.result) {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(body.result, now(), transactionId, reason = body.message)
                             }
-                            return@submit
                         }
-
-                        when (response.code) {
-                            400, 401, 403, 404, 405 -> {
-                                throw RuntimeException("Client error code: ${response.code}")
-                            }
-
-                            500 -> delay = 0
-                        }
-
-                        attempt++
-                        Thread.sleep(delay)
+                    } finally {
+                        // Всегда освобождаем слот
+                        ongoingWindow.releaseWindow()
                     }
-                } catch (e: SocketTimeoutException) {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                } catch (e: Exception) {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                } finally {
-                    ongoingWindow.releaseWindow()
                 }
-            }
         }
     }
 
